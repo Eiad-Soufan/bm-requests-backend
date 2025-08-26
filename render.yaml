@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: bm-requests-backend
+    runtime: python
+    region: singapore
+    plan: free
+    buildCommand: |
+      pip install -r requirements.txt
+      python manage.py collectstatic --noinput
+    startCommand: gunicorn model_system.wsgi:application
+    preDeployCommand: python manage.py migrate
+    envVars:
+      - key: DJANGO_SECRET_KEY
+        generateValue: true
+      - key: DEBUG
+        value: "False"
+      - key: ALLOWED_HOSTS
+        value: "*"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: bm-requests-db
+          property: connectionString
+
+databases:
+  - name: bm-requests-db
+    plan: free
+    region: singapore
