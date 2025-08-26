@@ -8,7 +8,7 @@ services:
       pip install -r requirements.txt
       python manage.py collectstatic --noinput
     # نشغّل المايغريشن عند الإقلاع (مسموح على Free)
-    startCommand: bash -c "python manage.py migrate --noinput && python manage.py import_employees || true && python manage.py createsuperuser --noinput || true && gunicorn model_system.wsgi:application"
+    startCommand: bash -c "python manage.py migrate --noinput && python manage.py import_employees || true && python manage.py import_forms || true && python manage.py createsuperuser --noinput || true && gunicorn model_system.wsgi:application"
     envVars:
       - key: DJANGO_SECRET_KEY
         generateValue: true
