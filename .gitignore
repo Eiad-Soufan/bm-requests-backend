@@ -1,0 +1,30 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual env
+.env/
+.venv/
+venv/
+
+# Environment & secrets
+.env
+.env.*
+*.env
+
+# Django
+*.sqlite3
+db.sqlite3
+staticfiles/
+media/
+# إذا كانت ملفات النماذج الثابتة داخل media/forms وتريد حفظها بالنسخة:
+# !media/forms/**
+
+# IDE
+.vscode/
+.idea/
+
+# OS junk
+.DS_Store
+Thumbs.db
