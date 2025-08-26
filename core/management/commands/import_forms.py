@@ -14,7 +14,7 @@ try:
 except Exception:
     raise CommandError("openpyxl غير مثبت. أضِفه إلى requirements.txt ثم ثبّته.")
 
-# ---------- أدوات مساعدة ----------
+# ----------------- أدوات مساعدة -----------------
 def norm(s):
     return (str(s).strip() if s is not None else "").strip()
 
@@ -36,7 +36,7 @@ def normalize_header(h):
 
 DASHES = {"\u2013", "\u2014", "_"}  # – — _
 def norm_code(code: str) -> str:
-    """تطبيع الكود: إزالة .pdf، توحيد الشرطات، حذف المسافات، تحويل HR-1 إلى HR-001."""
+    """تطبيع الكود: إزالة .pdf، توحيد الشرطات، حذف المسافات، وتحويل HR-1 إلى HR-001."""
     s = norm(code)
     if not s:
         return ""
@@ -45,18 +45,18 @@ def norm_code(code: str) -> str:
         s = s.replace(d, "-")
     s = re.sub(r"\s+", "", s)
     s = s.lower()
-    # letter+digits مع شرطة اختيارية
     m = re.match(r"^([a-z]+)-?(\d+)$", s)
     if m:
         letters, num = m.group(1), m.group(2).zfill(3)
         return f"{letters}-{num}"
     return s
 
-def find_models(app_label=None):
-    def has_fields(model, needed):
-        field_names = {f.name for f in model._meta.get_fields() if hasattr(f, "name")}
-        return needed.issubset(field_names)
+def has_fields(model, needed):
+    field_names = {f.name for f in model._meta.get_fields() if hasattr(f, "name")}
+    return needed.issubset(field_names)
 
+def find_models(app_label=None):
+    """إرجاع Section و FormModel من التطبيق المحدد أو بالكشف التلقائي."""
     if app_label:
         try:
             Section = apps.get_model(app_label, "Section")
@@ -64,7 +64,6 @@ def find_models(app_label=None):
             return Section, FormModel
         except LookupError as e:
             raise CommandError(f"لا يوجد app '{app_label}' يحوي Section/FormModel. ({e})")
-
     Section = FormModel = None
     for m in apps.get_models():
         if m.__name__ == "Section" and has_fields(m, {"name_ar", "name_en"}):
@@ -81,6 +80,18 @@ def find_models(app_label=None):
         )
     return Section, FormModel
 
+def detect_header_row(ws, max_scan=15):
+    """البحث عن صف العناوين خلال أول N صفوف باحتساب تطابق الأسماء المعروفة."""
+    wanted = {"serial_number", "name_ar", "name_en", "category", "description", "section"}
+    best = (0, 1, [])  # (score, row_idx, headers)
+    for r in range(1, min(ws.max_row, max_scan) + 1):
+        cells = [normalize_header(c.value) for c in ws[r]]
+        score = sum(1 for v in cells if v in wanted)
+        if score > best[0]:
+            best = (score, r, cells)
+    return best  # يرجع (score, header_row_idx, headers)
+
+# ----------------- الأمر -----------------
 class Command(BaseCommand):
     help = "يقرأ كل ملفات PDF في data/ ويطابقها مع صفوف forms.xlsx (كل الشيتات) ويُنشئ/يحدّث FormModel."
 
@@ -97,6 +108,8 @@ class Command(BaseCommand):
                             help="تشغيل تجريبي بلا حفظ")
         parser.add_argument("--app-label",
                             help="وسم تطبيق Django الذي يحوي Section وFormModel (مثل: core)")
+        parser.add_argument("--create-missing-sections", action="store_true",
+                            help="إنشاء الأقسام المفقودة تلقائيًا إذا لم تُوجد في قاعدة البيانات.")
 
     def handle(self, *args, **opts):
         data_dir = Path(opts["data_dir"]).resolve()
@@ -104,6 +117,7 @@ class Command(BaseCommand):
         sheet_only = opts.get("sheet")
         dry_run = opts["dry_run"]
         app_label = opts.get("app_label")
+        create_missing_sections = opts["create_missing_sections"]
 
         if not data_dir.exists():
             raise CommandError(f"مجلد البيانات غير موجود: {data_dir}")
@@ -124,23 +138,28 @@ class Command(BaseCommand):
         if not pdf_index:
             self.stdout.write(self.style.WARNING("لم يتم العثور على أي PDF في المجلد."))
 
-        # 2) قراءة كل الشيتات من الإكسل
+        # 2) قراءة كل الشيتات من الإكسل مع كشف صف العناوين
         wb = load_workbook(excel_path, data_only=True)
         sheetnames = [sheet_only] if sheet_only else wb.sheetnames
 
         rows_data = []
         for sname in sheetnames:
             ws = wb[sname]
-            header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True))
-            headers = [normalize_header(h) for h in header_row]
-            for row in ws.iter_rows(min_row=2, values_only=True):
+            score, header_row_idx, headers = detect_header_row(ws)
+            if score == 0:
+                # لا عناوين واضحة — تجاهل الشيت
+                self.stdout.write(self.style.WARNING(f"تخطّي الشيت '{sname}' لعدم العثور على صف عناوين مناسب."))
+                continue
+
+            # قراءة البيانات أسفل صف العناوين
+            for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
                 if row is None:
                     continue
-                row_dict = {headers[i]: row[i] for i in range(min(len(headers), len(row)))}
+                row_dict = {normalize_header(headers[i]): row[i] for i in range(min(len(headers), len(row)))}
                 serial = norm(row_dict.get("serial_number"))
                 if not serial:
                     continue
-                section_name = norm(row_dict.get("section")) or norm(sname)  # ← خذ اسم الشيت كقسم إن لم يوجد عمود
+                section_name = norm(row_dict.get("section")) or norm(sname)  # إن لم يوجد عمود قسم، استخدم اسم الشيت
                 rows_data.append({
                     "serial_number": serial,
                     "serial_key": norm_code(serial),
@@ -155,9 +174,6 @@ class Command(BaseCommand):
         excel_index = {}
         for r in rows_data:
             if r["serial_key"]:
-                if r["serial_key"] in excel_index:
-                    # آخر واحد يغلب؛ يمكن لاحقًا طباعة تحذير ازدواجية
-                    pass
                 excel_index[r["serial_key"]] = r
 
         self.stdout.write(self.style.NOTICE(f"🧾 Loaded {len(rows_data)} rows from {len(sheetnames)} sheet(s)."))
@@ -177,23 +193,20 @@ class Command(BaseCommand):
                     problems["لا يوجد صف في الإكسل لهذا الكود"].append(pdf_path.name)
                     continue
 
-                # ابحث عن القسم
+                # ابحث/أنشئ القسم
                 section_name = row.get("section")
                 section_obj = (Section.objects.filter(name_ar__iexact=section_name).first()
                                or Section.objects.filter(name_en__iexact=section_name).first())
                 if not section_obj:
-                    skipped_no_section += 1
-                    problems["القسم غير موجود في قاعدة البيانات"].append(f"{pdf_path.name} -> {section_name!r}")
-                    continue
+                    if create_missing_sections and not dry_run:
+                        # أنشئ قسمًا جديدًا بالاسمين نفسه مؤقتًا
+                        section_obj = Section.objects.create(name_ar=section_name, name_en=section_name)
+                    else:
+                        skipped_no_section += 1
+                        problems["القسم غير موجود في قاعدة البيانات"].append(f"{pdf_path.name} -> {section_name!r}")
+                        continue
 
-                # أنشئ/حدّث
-                obj = apps.get_model(section_obj._meta.app_label, "FormModel").objects.filter(
-                    serial_number__iexact=row["serial_number"]
-                ).first()
-                # إن لم تكن FormModel في نفس app للـSection استرجعها مباشرة
-                FormM = apps.get_model(FormModel._meta.app_label, FormModel.__name__)
-
-                obj = FormM.objects.filter(serial_number__iexact=row["serial_number"]).first()
+                obj = FormModel.objects.filter(serial_number__iexact=row["serial_number"]).first()
 
                 if obj:
                     changed = False
@@ -214,7 +227,7 @@ class Command(BaseCommand):
                     if changed:
                         updated += 1
                 else:
-                    obj = FormM(
+                    obj = FormModel(
                         section=section_obj,
                         serial_number=row["serial_number"],
                         name_ar=row.get("name_ar", ""),
@@ -228,7 +241,7 @@ class Command(BaseCommand):
                         obj.save()
                     created += 1
 
-            # تحذير لصفوف الإكسل التي لا يوجد لها PDF مقابل
+            # صفوف لا PDF لها
             for key, r in excel_index.items():
                 if key not in pdf_index:
                     skipped_no_pdf += 1
@@ -249,7 +262,7 @@ class Command(BaseCommand):
         if problems:
             self.stdout.write("\nتفاصيل المشاكل:")
             for k, items in problems.items():
-                for it in items[:40]:
+                for it in items[:50]:
                     self.stdout.write(f" - {k}: {it}")
-            if any(len(v) > 40 for v in problems.values()):
+            if any(len(v) > 50 for v in problems.values()):
                 self.stdout.write("... (تم تقصير القائمة)")
