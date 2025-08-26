@@ -7,8 +7,8 @@ services:
     buildCommand: |
       pip install -r requirements.txt
       python manage.py collectstatic --noinput
-    startCommand: gunicorn model_system.wsgi:application
-    preDeployCommand: python manage.py migrate
+    # نشغّل المايغريشن عند الإقلاع (مسموح على Free)
+    startCommand: bash -c "python manage.py migrate --noinput && gunicorn model_system.wsgi:application"
     envVars:
       - key: DJANGO_SECRET_KEY
         generateValue: true
