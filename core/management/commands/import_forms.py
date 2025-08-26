@@ -1,5 +1,5 @@
 # management/commands/import_forms.py
-import os
+import re
 from pathlib import Path
 from collections import defaultdict
 
@@ -21,7 +21,8 @@ def norm(s):
 def normalize_header(h):
     h = norm(h).lower()
     mapping = {
-        "serial_number": {"serial", "serial number", "code", "form code", "رقم", "الكود", "serial_number"},
+        "serial_number": {"serial", "serial number", "form no", "form number", "form id",
+                          "code", "form code", "رقم", "الكود", "serial_number"},
         "name_ar": {"name_ar", "arabic", "arabic name", "الاسم العربي", "name ar"},
         "name_en": {"name_en", "english", "english name", "الاسم الانكليزي", "name en"},
         "category": {"category", "الفئة", "القسم الداخلي", "التصنيف"},
@@ -33,43 +34,55 @@ def normalize_header(h):
             return key
     return h
 
+DASHES = {"\u2013", "\u2014", "_"}  # – — _
+def norm_code(code: str) -> str:
+    """تطبيع الكود: إزالة .pdf، توحيد الشرطات، حذف المسافات، تحويل HR-1 إلى HR-001."""
+    s = norm(code)
+    if not s:
+        return ""
+    s = s.replace(".PDF", "").replace(".pdf", "")
+    for d in DASHES:
+        s = s.replace(d, "-")
+    s = re.sub(r"\s+", "", s)
+    s = s.lower()
+    # letter+digits مع شرطة اختيارية
+    m = re.match(r"^([a-z]+)-?(\d+)$", s)
+    if m:
+        letters, num = m.group(1), m.group(2).zfill(3)
+        return f"{letters}-{num}"
+    return s
+
 def find_models(app_label=None):
-    """
-    يُعيد موديلات Section وFormModel إمّا من app محدد، أو بالكشف التلقائي عبر الأسماء والحقول المتوقعة.
-    """
     def has_fields(model, needed):
         field_names = {f.name for f in model._meta.get_fields() if hasattr(f, "name")}
         return needed.issubset(field_names)
-
-    Section = FormModel = None
 
     if app_label:
         try:
             Section = apps.get_model(app_label, "Section")
             FormModel = apps.get_model(app_label, "FormModel")
+            return Section, FormModel
         except LookupError as e:
-            raise CommandError(f"لا يوجد app بالوسم '{app_label}' أو لا يحوي Section/FormModel. ({e})")
-    else:
-        # كشف تلقائي
-        for m in apps.get_models():
-            if m.__name__ == "Section" and has_fields(m, {"name_ar", "name_en"}):
-                Section = m
-            if m.__name__ == "FormModel" and has_fields(
-                m, {"serial_number", "name_ar", "name_en", "category", "description", "file"}
-            ):
-                FormModel = m
-        if not Section or not FormModel:
-            labels = [a.label for a in apps.get_app_configs()]
-            raise CommandError(
-                "تعذّر إيجاد Section/FormModel تلقائيًا. مرّر اسم التطبيق الصحيح بخيار --app-label.\n"
-                f"التطبيقات المتاحة: {', '.join(labels)}"
-            )
+            raise CommandError(f"لا يوجد app '{app_label}' يحوي Section/FormModel. ({e})")
 
+    Section = FormModel = None
+    for m in apps.get_models():
+        if m.__name__ == "Section" and has_fields(m, {"name_ar", "name_en"}):
+            Section = m
+        if m.__name__ == "FormModel" and has_fields(
+            m, {"serial_number", "name_ar", "name_en", "category", "description", "file"}
+        ):
+            FormModel = m
+    if not Section or not FormModel:
+        labels = [a.label for a in apps.get_app_configs()]
+        raise CommandError(
+            "تعذّر إيجاد Section/FormModel تلقائيًا. مرّر اسم التطبيق بخيار --app-label.\n"
+            f"التطبيقات المتاحة: {', '.join(labels)}"
+        )
     return Section, FormModel
 
-
 class Command(BaseCommand):
-    help = "يمسح مجلد data عن ملفات PDF، يقرأ forms.xlsx، وينشئ/يحدّث FormModel ويربطه بالقسم المناسب."
+    help = "يقرأ كل ملفات PDF في data/ ويطابقها مع صفوف forms.xlsx (كل الشيتات) ويُنشئ/يحدّث FormModel."
 
     def add_arguments(self, parser):
         parser.add_argument("--data-dir",
@@ -78,14 +91,17 @@ class Command(BaseCommand):
         parser.add_argument("--excel",
                             default="forms.xlsx",
                             help="اسم/مسار ملف الإكسل داخل مجلد البيانات (افتراضي forms.xlsx)")
+        parser.add_argument("--sheet",
+                            help="إن رغبت: اسم شيت محدد داخل الإكسل بدل قراءة الكل.")
         parser.add_argument("--dry-run", action="store_true",
                             help="تشغيل تجريبي بلا حفظ")
         parser.add_argument("--app-label",
-                            help="وسم تطبيق Django الذي يحوي Section وFormModel (مثال: core أو model_system)")
+                            help="وسم تطبيق Django الذي يحوي Section وFormModel (مثل: core)")
 
     def handle(self, *args, **opts):
         data_dir = Path(opts["data_dir"]).resolve()
         excel_path = (data_dir / opts["excel"]).resolve()
+        sheet_only = opts.get("sheet")
         dry_run = opts["dry_run"]
         app_label = opts.get("app_label")
 
@@ -94,39 +110,58 @@ class Command(BaseCommand):
         if not excel_path.exists():
             raise CommandError(f"ملف الإكسل غير موجود: {excel_path}")
 
-        # ✅ اجلب الموديلات بطريقة مرنة
         Section, FormModel = find_models(app_label)
 
         self.stdout.write(self.style.NOTICE(f"📂 DATA DIR: {data_dir}"))
         self.stdout.write(self.style.NOTICE(f"📄 EXCEL  : {excel_path.name}"))
-        self.stdout.write(self.style.NOTICE(f"🧩 MODELS : {Section._meta.label}, {FormModel._meta.label}"))
 
         # 1) فهرس ملفات PDF
         pdf_index = {}
         for p in data_dir.glob("*.pdf"):
-            code = p.stem.strip()
-            pdf_index[code.lower()] = p
+            key = norm_code(p.stem)
+            if key:
+                pdf_index[key] = p
         if not pdf_index:
             self.stdout.write(self.style.WARNING("لم يتم العثور على أي PDF في المجلد."))
 
-        # 2) قراءة الإكسل
+        # 2) قراءة كل الشيتات من الإكسل
         wb = load_workbook(excel_path, data_only=True)
-        ws = wb["forms"] if "forms" in wb.sheetnames else wb.active
-        headers = [normalize_header(c.value) for c in next(ws.iter_rows(min_row=1, max_row=1))]
+        sheetnames = [sheet_only] if sheet_only else wb.sheetnames
+
         rows_data = []
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            row_dict = {headers[i]: row[i] for i in range(min(len(headers), len(row)))}
-            rd = {
-                "serial_number": norm(row_dict.get("serial_number")),
-                "name_ar": norm(row_dict.get("name_ar")),
-                "name_en": norm(row_dict.get("name_en")),
-                "category": norm(row_dict.get("category")),
-                "description": norm(row_dict.get("description")),
-                "section": norm(row_dict.get("section")),
-            }
-            if rd["serial_number"]:
-                rows_data.append(rd)
-        excel_index = {r["serial_number"].lower(): r for r in rows_data}
+        for sname in sheetnames:
+            ws = wb[sname]
+            header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True))
+            headers = [normalize_header(h) for h in header_row]
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                if row is None:
+                    continue
+                row_dict = {headers[i]: row[i] for i in range(min(len(headers), len(row)))}
+                serial = norm(row_dict.get("serial_number"))
+                if not serial:
+                    continue
+                section_name = norm(row_dict.get("section")) or norm(sname)  # ← خذ اسم الشيت كقسم إن لم يوجد عمود
+                rows_data.append({
+                    "serial_number": serial,
+                    "serial_key": norm_code(serial),
+                    "name_ar": norm(row_dict.get("name_ar")),
+                    "name_en": norm(row_dict.get("name_en")),
+                    "category": norm(row_dict.get("category")),
+                    "description": norm(row_dict.get("description")),
+                    "section": section_name,
+                })
+
+        # فهرس بحسب الكود المطَبَّع
+        excel_index = {}
+        for r in rows_data:
+            if r["serial_key"]:
+                if r["serial_key"] in excel_index:
+                    # آخر واحد يغلب؛ يمكن لاحقًا طباعة تحذير ازدواجية
+                    pass
+                excel_index[r["serial_key"]] = r
+
+        self.stdout.write(self.style.NOTICE(f"🧾 Loaded {len(rows_data)} rows from {len(sheetnames)} sheet(s)."))
+        self.stdout.write(self.style.NOTICE(f"📑 PDFs found: {len(pdf_index)}"))
 
         created = updated = skipped_no_excel = skipped_no_section = skipped_no_pdf = 0
         problems = defaultdict(list)
@@ -135,24 +170,30 @@ class Command(BaseCommand):
         def do_work():
             nonlocal created, updated, skipped_no_excel, skipped_no_section, skipped_no_pdf
 
-            for code_lower, pdf_path in pdf_index.items():
-                row = excel_index.get(code_lower)
+            for key, pdf_path in pdf_index.items():
+                row = excel_index.get(key)
                 if not row:
                     skipped_no_excel += 1
                     problems["لا يوجد صف في الإكسل لهذا الكود"].append(pdf_path.name)
                     continue
 
+                # ابحث عن القسم
                 section_name = row.get("section")
-                section_obj = None
-                if section_name:
-                    section_obj = (Section.objects.filter(name_ar__iexact=section_name).first()
-                                   or Section.objects.filter(name_en__iexact=section_name).first())
+                section_obj = (Section.objects.filter(name_ar__iexact=section_name).first()
+                               or Section.objects.filter(name_en__iexact=section_name).first())
                 if not section_obj:
                     skipped_no_section += 1
                     problems["القسم غير موجود في قاعدة البيانات"].append(f"{pdf_path.name} -> {section_name!r}")
                     continue
 
-                obj = FormModel.objects.filter(serial_number__iexact=row["serial_number"]).first()
+                # أنشئ/حدّث
+                obj = apps.get_model(section_obj._meta.app_label, "FormModel").objects.filter(
+                    serial_number__iexact=row["serial_number"]
+                ).first()
+                # إن لم تكن FormModel في نفس app للـSection استرجعها مباشرة
+                FormM = apps.get_model(FormModel._meta.app_label, FormModel.__name__)
+
+                obj = FormM.objects.filter(serial_number__iexact=row["serial_number"]).first()
 
                 if obj:
                     changed = False
@@ -162,20 +203,18 @@ class Command(BaseCommand):
                         new_val = row.get(fld, "")
                         if getattr(obj, fld) != new_val:
                             setattr(obj, fld, new_val); changed = True
-
                     filename = pdf_path.name
                     if not obj.file or Path(obj.file.name).name != filename:
                         if not dry_run:
                             with open(pdf_path, "rb") as fh:
                                 obj.file.save(filename, File(fh), save=False)
                         changed = True
-
                     if changed and not dry_run:
                         obj.save()
                     if changed:
                         updated += 1
                 else:
-                    obj = FormModel(
+                    obj = FormM(
                         section=section_obj,
                         serial_number=row["serial_number"],
                         name_ar=row.get("name_ar", ""),
@@ -189,14 +228,17 @@ class Command(BaseCommand):
                         obj.save()
                     created += 1
 
-            for code_lower in set(excel_index.keys()) - set(pdf_index.keys()):
-                skipped_no_pdf += 1
-                problems["لا يوجد PDF لهذا الكود"].append(excel_index[code_lower]["serial_number"])
+            # تحذير لصفوف الإكسل التي لا يوجد لها PDF مقابل
+            for key, r in excel_index.items():
+                if key not in pdf_index:
+                    skipped_no_pdf += 1
+                    problems["لا يوجد PDF لهذا الكود"].append(r["serial_number"])
 
         if dry_run:
             self.stdout.write(self.style.WARNING("DRY RUN — لن يتم أي حفظ."))
         do_work()
 
+        # ملخص
         self.stdout.write("")
         self.stdout.write(self.style.SUCCESS(f"✅ Created: {created}"))
         self.stdout.write(self.style.SUCCESS(f"✅ Updated: {updated}"))
@@ -207,7 +249,7 @@ class Command(BaseCommand):
         if problems:
             self.stdout.write("\nتفاصيل المشاكل:")
             for k, items in problems.items():
-                for it in items[:30]:
+                for it in items[:40]:
                     self.stdout.write(f" - {k}: {it}")
-            if any(len(v) > 30 for v in problems.values()):
+            if any(len(v) > 40 for v in problems.values()):
                 self.stdout.write("... (تم تقصير القائمة)")
