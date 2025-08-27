@@ -60,12 +60,19 @@ def public_form_preview(request, pk):
         raise Http404("Form not found")
 
 
-# 📄 عرض النموذج الداخلي
+from django.shortcuts import get_object_or_404
+from django.http import FileResponse, Http404
+from django.views.decorators.clickjacking import xframe_options_exempt
+from .models import FormModel
+
+@xframe_options_exempt
 def preview_form(request, form_id):
     form = get_object_or_404(FormModel, id=form_id)
-    response = FileResponse(form.file.open('rb'), content_type='application/pdf')
-    response['Content-Disposition'] = 'inline; filename="form.pdf"'
-    return response
+    if not form.file or not form.file.storage.exists(form.file.name):
+        raise Http404("File not found on server")
+    resp = FileResponse(form.file.open('rb'), content_type='application/pdf')
+    resp['Content-Disposition'] = f'inline; filename="{form.file.name.rsplit("/",1)[-1]}"'
+    return resp
 
 
 # 🔔 إرسال إشعار لمستخدمين أو للجميع
@@ -341,5 +348,6 @@ def mark_all_complaints_seen(request):
             is_responded=True,
             is_seen_by_employee=False
         ).update(is_seen_by_employee=True)
+
 
     return Response({'status': 'All marked as seen'})
